@@ -1,0 +1,18 @@
+{
+  "name": "hardware-skills",
+  "owner": {
+    "name": "Atemkraft Ventures Ltd."
+  },
+  "plugins": [
+    {
+      "name": "pcb-signoff",
+      "source": "./",
+      "description": "Board review, datasheet check, JLC placement check, print review and JLCPCB cart for KiCad boards."
+    },
+    {
+      "name": "kicad-happy",
+      "source": "./vendor/kicad-happy",
+      "description": "Andrew Klofas's KiCad review skills (MIT, v3.0.1, vendored unmodified): schematic and PCB analysis, EMC pre-compliance, SPICE, datasheet extraction, distributor sourcing, JLCPCB/PCBWay fab prep."
+    }
+  ]
+}

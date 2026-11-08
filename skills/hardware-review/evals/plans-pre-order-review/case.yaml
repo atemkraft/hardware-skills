@@ -1,0 +1,7 @@
+schema_version: "1.1"
+name: plans-pre-order-review
+expected_outcome: |
+  plan.md gives an ordered pre-order plan with commands: the gates (ERC, DRC with schematic
+  parity), JLC placement and stock check, kicad-happy review, datasheet check, special nets
+  / power / thermal, the enclosure print review on box.3mf, carting without checking out,
+  and the results handed to the owner, who signs before paying.

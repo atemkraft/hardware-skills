@@ -1,0 +1,523 @@
+"""Deep Review gate: a quote must keep the page's numbers, signs, decimal points,
+comparison operators and unit letters; malformed evidence, a non-array findings
+list and a page below 1 or past the end of the PDF quarantine instead of crashing
+or verifying."""
+import json, os, shutil, subprocess, sys, tempfile, unittest
+from pathlib import Path
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[2]
+REVIEW = ROOT / "skills" / "kicad" / "review" / "scripts"
+GATE = REVIEW / "deep_review_gate.py"
+for p in (REVIEW, ROOT / "skills" / "kicad" / "scripts"):
+    if str(p) not in sys.path:
+        sys.path.insert(0, str(p))
+
+import deep_review_gate  # noqa: E402
+
+PAGE_A = "Maximum resistance of device at 20°C.\nThe over-\nvoltage clamp limit is 5.5 V"
+
+# (quote, page text, expected, what the quote claims against the page)
+QUOTE_CASES = [
+    ("Maximum input voltage 55 V", "Maximum input voltage 5.5 V", False, "decimal dropped"),
+    ("Maximum input voltage 5.5 V", "Maximum input voltage 55 V", False, "decimal added"),
+    ("Maximum input voltage 5.5V", "Maximum input voltage 5.5 V", True, "unit spacing"),
+    ("Operating range -40 C to 85 C", "Operating range 40 C to 85 C", False, "sign added"),
+    ("Operating range 40 C to 85 C", "Operating range -40 C to 85 C", False, "sign dropped"),
+    ("Operating range -40°C to +85°C", "Operating range −40 °C to +85 °C", True, "U+2212 minus"),
+    ("Operating range -40°C to 85°C", "Operating range –40°C to 85°C", True, "en dash minus"),
+    ("40°C", "TA = −40°C", False, "number inside a signed number"),
+    ("VIN < 5 V", "VIN > 5 V", False, "operator flipped"),
+    ("VIN ≤ 5 V", "VIN ≤ 5 V", True, "same operator"),
+    ("VIN <= 5 V", "VIN ≤ 5 V", True, "ASCII spelling of ≤"),
+    ("VIN<5V", "VIN < 5 V", True, "operator spacing"),
+    ("...", "anything at all", False, "no content"),
+    ("…", "anything at all", False, "no content, Unicode ellipsis"),
+    ("- -", "anything at all", False, "punctuation only"),
+    ("SOT-23 package", "SOT-23 package", True, "identifier hyphen"),
+    ("SOT23 package", "SOT-23 package", True, "identifier hyphen dropped"),
+    ("3.3-5.5 V", "3.3-5.5 V", True, "range dash"),
+    ("10 µA", "10 μA", True, "micro sign vs Greek mu"),
+    ("10 µA", "10 A", False, "unit prefix dropped"),
+    ("1e-3 A", "1e3 A", False, "exponent sign dropped"),
+    ("1e3 A", "1e-3 A", False, "exponent sign added"),
+    ("1E-6 A", "1e−6 A", True, "Unicode minus in an exponent"),
+    ("3 A", "1e-3 A", False, "exponent read as a value"),
+    ("1e-3 A", "1e-3A", True, "exponent, unit spacing"),
+    ("1 kΩ", "1 k", False, "ohm sign dropped"),
+    ("1,000 hours", "1,000 hours", True, "thousands comma"),
+    ("500 mA", "1,500 mA", False, "tail of a comma-grouped number"),
+    ("Imax 1", "Imax 1,500 mA", False, "head of a comma-grouped number"),
+    ("5 V", "1,5 V", False, "tail of a decimal comma"),
+    ("1,500mA", "1,500 mA", True, "comma-grouped number, unit spacing"),
+    ("Maximum resistance of device at 20°C", PAGE_A, True, "verbatim sentence"),
+    ("maximum resistance of device at 20 ° C", PAGE_A, True, "case and spaced degree"),
+    ("the overvoltage clamp limit is 5.5V", PAGE_A, True, "line-break hyphenation joined"),
+    ("over-voltage clamp limit", PAGE_A, True, "line-break hyphenation kept"),
+    ("Maximum resistance of device at 25°C", PAGE_A, False, "temperature changed"),
+    ("alpha bravo ... echo foxtrot", "alpha bravo charlie delta echo foxtrot", True, "ellipsis elides the middle"),
+    ("echo foxtrot ... alpha bravo", "alpha bravo charlie delta echo foxtrot", False, "ellipsis halves reversed"),
+    ("alpha zulu charlie", "alpha bravo charlie delta echo foxtrot", False, "middle word differs"),
+    ("VCC + 0.3 V", "VCC + 0.3 V", True, "plus spaced"),
+    ("VIN-0.3V", "VIN – 0.3V", True, "binary minus spelled differently"),
+    ("0.9 1.0", "0.91.0", False, "two numbers are not one"),
+    ("15 V", "±15 V", False, "± dropped"),
+    ("15 V", "+/-15 V", False, "+/- dropped"),
+    ("-15 V", "±15 V", False, "± read as minus"),
+    ("+15 V", "±15 V", False, "± read as plus"),
+    ("0.5 V", "5 V ±0.5 V", False, "tolerance read as a value"),
+    ("±15 V", "±15 V", True, "same ±"),
+    ("15 V", "± 15 V", False, "± dropped, spaced"),
+    ("+15 V", "± 15 V", False, "± read as plus, spaced"),
+    ("0.5 V", "5 V ± 0.5 V", False, "tolerance read as a value, spaced"),
+    ("5 V", "5 V ± 0.5 V", True, "value before a spaced tolerance"),
+    ("±15 V", "± 15 V", True, "spaced ± vs tight quote"),
+    ("± 15 V", "±15 V", True, "spaced quote vs tight ±"),
+    ("± 15 V", "± 15 V", True, "same spaced ±"),
+    ("15 V", "±\n15 V", False, "± at a line end"),
+    ("± 15 V", "±\n15 V", True, "spaced quote vs ± at a line end"),
+    ("15 V", "± 15 V and an unrelated 15 V rail", True, "unsigned 15 V elsewhere on the page"),
+    ("± x 15 V", "± x 15 V", True, "± before a word is not merged with a later number"),
+    ("x 15 V", "± x 15 V", True, "word between ± and number stays apart"),
+    ("± 15 V", "± x 15 V", False, "± is not joined to a number past another token"),
+    ("±15 V", "+/-15 V", True, "+/- spelling of ±"),
+    ("+/- 15 V", "± 15 V", True, "spaced +/- spelling of a spaced ±"),
+    ("±15V", "+-15 V", True, "+- spelling of ±"),
+    ("a ± b", "a ± b", True, "± between words"),
+    ("5 V", ".5 V", False, "leading point dropped"),
+    ("5 V", "±.5 V", False, "leading point dropped after ±"),
+    ("5 V", "-.5 V", False, "leading point dropped after minus"),
+    ("0.5 V", "-.5 V", False, "sign dropped before a leading point"),
+    (".5 V", ".5 V", True, "same leading point"),
+    ("0.5 V", ".5 V", True, "0.5 spelling of .5"),
+    (".5 V", "0.5 V", True, ".5 spelling of 0.5"),
+    ("±0.5 V", "±.5 V", True, "± with either spelling"),
+    ("VCC + 0.3 V", "VCC + – 0.3 V", True, "spaced plus and dash"),
+    ("0.5", "100Ω.5", False, "point after a non-ASCII letter"),
+    ("-5 V", "Ω-5 V", False, "dash after a non-ASCII letter"),
+    ("-15 V", "+/ -15 V", False, "spaced +/ - is ±"),
+    ("±15 V", "+/ -15 V", True, "± vs spaced +/ -"),
+    ("-15 V", "+ /-15 V", False, "spaced + /- is ±"),
+    ("±15 V", "+ /-15 V", True, "± vs spaced + /-"),
+    ("-15 V", "+/ −15 V", False, "spaced +/ with a Unicode minus is ±"),
+    ("±15 V", "+/ −15 V", True, "± vs spaced +/ −"),
+    ("Features.....1 2 Applications", "1 Features..........1 2 Applications", True,
+     "dot leader cut mid-run"),
+    ("Overview....34 In-System", "12.6. Overview..............34 In-System", True,
+     "dot leader before a page number"),
+    ("-15 V", "+/−15 V", False, "minus vs +/−15 V"),
+    ("15 V", "+/−15 V", False, "unsigned vs +/−15 V"),
+    ("±15 V", "+/−15 V", True, "± vs +/−15 V"),
+    ("-15 V", "+/–15 V", False, "minus vs +/–15 V"),
+    ("15 V", "+/–15 V", False, "unsigned vs +/–15 V"),
+    ("±15 V", "+/–15 V", True, "± vs +/–15 V"),
+    ("-15 V", "+–15 V", False, "minus vs +–15 V"),
+    ("15 V", "+–15 V", False, "unsigned vs +–15 V"),
+    ("±15 V", "+–15 V", True, "± vs +–15 V"),
+    ("-15 V", "+—15 V", False, "minus vs +—15 V"),
+    ("15 V", "+—15 V", False, "unsigned vs +—15 V"),
+    ("±15 V", "+—15 V", True, "± vs +—15 V"),
+]
+
+
+class QuoteMatchTest(unittest.TestCase):
+    def test_cases(self):
+        for quote, text, expected, why in QUOTE_CASES:
+            with self.subTest(why=why, quote=quote):
+                self.assertIs(deep_review_gate._quote_in_text(quote, text), expected)
+
+    def test_control_characters_in_page_text_are_not_numbers(self):
+        # pdftotext emits C0 bytes for symbol fonts; they must not read as a sign
+        # or a decimal point
+        page = "Supply \x01 \x02 voltage 3\x023 V and \x0140 C"
+        self.assertTrue(deep_review_gate._quote_in_text("Supply voltage 3", page))
+        self.assertFalse(deep_review_gate._quote_in_text("voltage 3.3 V", page))
+        self.assertFalse(deep_review_gate._quote_in_text("and -40 C", page))
+
+
+class EvidenceTest(unittest.TestCase):
+    """Pin citations and computations, checked without pdftotext."""
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.item_schema = json.loads(deep_review_gate.SCHEMA_PATH.read_text(
+            encoding="utf-8"))["properties"]["findings"]["items"]
+
+    def _sets(self, sch=None, pcb=None):
+        for name, data in (("schematic.json", sch), ("pcb.json", pcb)):
+            if data is not None:
+                (self.tmp / name).write_text(json.dumps(data), encoding="utf-8")
+        return deep_review_gate.load_anchor_sets(self.tmp)
+
+    def _gate(self, evidence, sets):
+        f = {"detector": "deep_review", "category": "power", "severity": "warning",
+             "confidence": "high", "summary": "s", "evidence": evidence}
+        return deep_review_gate.gate_finding(f, self.item_schema, *sets,
+                                             str(self.tmp), str(self.tmp))
+
+    SCH = {"components": [{"reference": "U3", "pin_nets": {"17": "VCC"}},
+                          {"reference": "U3", "pin_nets": {"4": "GND"}},
+                          {"reference": "R1"}],
+           "nets": {"VCC": {"pins": [{"component": "U3", "pin_number": "17", "pin_name": "VIN"}]},
+                    "__unnamed_0": {"pins": [{"component": "U3", "pin_number": "9", "pin_name": "NC"}]}}}
+
+    def test_unrun_computation_is_partial(self):
+        (self.tmp / "check.py").write_text("print(1)\n", encoding="utf-8")
+        sets = self._sets(sch=self.SCH)
+        for comp in ({"description": "d", "result": "r"},
+                     {"description": "d", "result": "r", "script": "check.py"}):
+            with self.subTest(comp=comp):
+                kept, bad = self._gate({"components": ["U3"], "computation": comp}, sets)
+                self.assertIsNone(bad)
+                self.assertEqual(kept["evidence_checked"], "partial")
+        _, bad = self._gate({"components": ["U3"], "computation":
+                             {"description": "d", "result": "r", "script": "nope.py"}}, sets)
+        self.assertEqual(bad["quarantine_reason"], "computation script not found: nope.py")
+
+    def test_pin_must_exist_on_its_component(self):
+        sets = self._sets(sch=self.SCH)
+        calc = {"description": "d", "result": "r"}
+        for pin, ok in (("U3.17", True), ("u3.vin", True), ("U3.4", True),
+                        ("U3.9", True), ("U3.99", False), ("U3", False),
+                        ("R1.2", True), ("U7.1", False)):
+            with self.subTest(pin=pin):
+                kept, bad = self._gate({"pins": [pin], "computation": calc}, sets)
+                self.assertIs(kept is not None, ok, bad and bad["quarantine_reason"])
+        _, bad = self._gate({"pins": ["U3.99"], "computation": calc}, sets)
+        self.assertEqual(bad["quarantine_reason"],
+                         "pin U3.99: U3 has no pin 99 in analyzer JSON")
+
+    def test_dotted_pin_name_splits_at_the_first_dot(self):
+        sch = {"components": [{"reference": "U1"}],
+               "nets": {"N": {"pins": [{"component": "U1", "pin_number": "5",
+                                        "pin_name": " P0.12 "}]}}}
+        sets = self._sets(sch=sch)
+        calc = {"description": "d", "result": "r"}
+        for pin, ok in (("U1.P0.12", True), ("U1.P0.13", False), ("U1.5", True)):
+            with self.subTest(pin=pin):
+                kept, bad = self._gate({"pins": [pin], "computation": calc}, sets)
+                self.assertIs(kept is not None, ok, bad and bad["quarantine_reason"])
+
+    def test_numbers_only_ref_leaves_name_citations_unchecked(self):
+        sch = {"components": [{"reference": "U3", "pin_nets": {"1": "VCC"}}], "nets": {}}
+        pcb = {"footprints": [{"reference": "J1", "pad_count": 1,
+                               "pad_nets": {"1": {"net": "GND"}}}]}
+        sets = self._sets(sch=sch, pcb=pcb)
+        calc = {"description": "d", "result": "r"}
+        for pin, ok in (("U3.VIN", True), ("U3.1", True), ("U3.2", False),
+                        ("J1.GND", True), ("J1.2", False)):
+            with self.subTest(pin=pin):
+                kept, bad = self._gate({"pins": [pin], "computation": calc}, sets)
+                self.assertIs(kept is not None, ok, bad and bad["quarantine_reason"])
+
+    def test_unchecked_pins_are_partial(self):
+        sch = {"components": [{"reference": "U3", "pin_nets": {"17": "VCC"}},
+                              {"reference": "R1"}], "nets": {}}
+        pcb = {"footprints": [
+            {"reference": "J1", "pad_count": 2, "pad_nets": {"1": {"net": "GND"}}}]}
+        sets = self._sets(sch=sch, pcb=pcb)
+        cite = {"mpn": "X", "page": 1, "quote": "q"}
+        for pin, partial in (("R1.2", True), ("J1.2", True), ("U3.VIN", True),
+                             ("U3.17", False)):
+            with self.subTest(pin=pin), mock.patch.object(
+                    deep_review_gate, "check_datasheet", return_value=([], False)):
+                kept, bad = self._gate({"pins": [pin], "datasheet": [cite]}, sets)
+                self.assertIsNone(bad)
+                self.assertEqual(kept["evidence_checked"],
+                                 "partial" if partial else "full")
+
+    def test_pcb_pads_off_every_net_leave_pins_unchecked(self):
+        pcb = {"footprints": [
+            {"reference": "J1", "pad_count": 2, "pad_nets": {"1": {"net": "GND"}}},
+            {"reference": "J2", "pad_count": 2,
+             "pad_nets": {"1": {"net": "GND"}, "2": {"net": "VCC", "pin": "Pin_2"}}}]}
+        comps, nets, pins = self._sets(pcb=pcb)
+        self.assertNotIn("J1", pins)
+        self.assertEqual(pins["J2"], {"1", "2", "PIN_2"})
+
+
+def _pdf(pages):
+    """A minimal PDF, one Helvetica text page per entry (WinAnsi: µ = 0xB5)."""
+    objs = ["<< /Type /Catalog /Pages 2 0 R >>", None,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"]
+    kids = []
+    for text in pages:
+        esc = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+        stream = f"BT /F1 12 Tf 72 720 Td ({esc}) Tj ET".encode("cp1252")
+        objs.append(b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"\nendstream")
+        objs.append(f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                    f"/Resources << /Font << /F1 3 0 R >> >> /Contents {len(objs)} 0 R >>")
+        kids.append(f"{len(objs)} 0 R")
+    objs[1] = f"<< /Type /Pages /Kids [{' '.join(kids)}] /Count {len(kids)} >>"
+    out, offsets = bytearray(b"%PDF-1.4\n"), []
+    for i, body in enumerate(objs, 1):
+        offsets.append(len(out))
+        body = body if isinstance(body, bytes) else body.encode("latin-1")
+        out += b"%d 0 obj\n" % i + body + b"\nendobj\n"
+    xref = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objs) + 1)
+    out += b"".join(b"%010d 00000 n \n" % o for o in offsets)
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objs) + 1, xref)
+    return bytes(out)
+
+
+PAGES = ["Maximum input voltage 5.5 V at -40 C", "Quiescent current 10 µA typical"]
+
+
+class PdftotextFormsTest(unittest.TestCase):
+    """poppler and xpdf report a page past the end differently; both are past the end."""
+
+    def _check(self, rc, stdout, stderr=""):
+        from unittest import mock
+        done = subprocess.CompletedProcess([], rc, stdout, stderr)
+        with mock.patch.object(deep_review_gate, "find_executable", return_value="/fake/pdftotext"), \
+                mock.patch.object(deep_review_gate, "find_pdf", return_value=Path("TPS1.pdf")), \
+                mock.patch.object(deep_review_gate.subprocess, "run", return_value=done):
+            return deep_review_gate.check_datasheet(
+                [{"mpn": "TPS1", "page": 3, "quote": "Maximum input voltage 5.5 V"}], ".")
+
+    def test_poppler_exit_99(self):
+        self.assertEqual(self._check(99, "", "Wrong page range given"),
+                         (["page 3 is past the end of TPS1.pdf"], False))
+
+    def test_xpdf_empty_output(self):
+        self.assertEqual(self._check(0, ""), (["page 3 is past the end of TPS1.pdf"], False))
+
+    def test_blank_page_is_a_page(self):
+        fails, _ = self._check(0, "\f")
+        self.assertEqual(len(fails), 1)
+        self.assertIn("quote not found page 3", fails[0])
+
+    def _windows_check(self, path_dirs, files):
+        from unittest import mock
+        from kicad_core import executables
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        cwd, bin_ = tmp / "cwd", tmp / "bin"
+        cwd.mkdir(); bin_.mkdir()
+        for where, name in files:
+            ((cwd, bin_)[where] / name).write_bytes(b"")
+        old = os.getcwd()
+        self.addCleanup(os.chdir, old)
+        os.chdir(cwd)
+        env = os.pathsep.join(str((cwd, bin_)[d]) if d else "." for d in path_dirs)
+        done = subprocess.CompletedProcess([], 0, "Maximum input voltage 5.5 V", "")
+        with mock.patch.object(executables, "_on_windows", return_value=True), \
+                mock.patch.dict(os.environ, {"PATH": env}), \
+                mock.patch.object(deep_review_gate, "find_pdf", return_value=Path("TPS1.pdf")), \
+                mock.patch.object(deep_review_gate.subprocess, "run", return_value=done) as run:
+            result = deep_review_gate.check_datasheet(
+                [{"mpn": "TPS1", "page": 3, "quote": "Maximum input voltage 5.5 V"}], ".")
+        return result, run, bin_
+
+    def test_windows_launches_absolute_pdftotext(self):
+        result, run, bin_ = self._windows_check([0, 1], [(0, "pdftotext.exe"), (1, "pdftotext.exe")])
+        self.assertEqual(run.call_args.args[0][0], str(bin_ / "pdftotext.exe"))
+
+    def test_windows_cwd_pdftotext_is_partial_and_not_run(self):
+        result, run, _ = self._windows_check([0], [(0, "pdftotext.exe")])
+        self.assertEqual(result, ([], True))
+        run.assert_not_called()
+
+
+@unittest.skipUnless(shutil.which("pdftotext"), "pdftotext (poppler) not installed")
+class GateCliTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        (self.tmp / "analysis").mkdir()
+        (self.tmp / "datasheets").mkdir()
+        (self.tmp / "datasheets" / "TPS1.pdf").write_bytes(_pdf(PAGES))
+        (self.tmp / "analysis" / "schematic.json").write_text(json.dumps(
+            {"components": [{"reference": "U1"}], "nets": {"VCC": {}}}), encoding="utf-8")
+
+    def _gate(self, doc, env=None, cwd=None, ds=True):
+        path = self.tmp / "deep_review.json"
+        raw = doc if isinstance(doc, str) else json.dumps(doc, ensure_ascii=False)
+        path.write_text(raw, encoding="utf-8")
+        cmd = [sys.executable, str(GATE), str(path),
+               "--analysis-dir", str(self.tmp / "analysis")]
+        if ds:
+            cmd += ["--datasheets-dir", str(self.tmp / "datasheets")]
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                           timeout=120, cwd=cwd,
+                           env=dict(os.environ, **(env or {})))
+        self.assertNotIn("Traceback", r.stderr)
+        after = path.read_text(encoding="utf-8")
+        return r, (json.loads(after) if after != raw else None)
+
+    @staticmethod
+    def _doc(findings, **top):
+        return {"schema_version": "1.0", "produced_for_run_id": "r",
+                "produced_at": "2026-10-29T00:00:00Z", "findings": findings,
+                "quarantined": [], **top}
+
+    @staticmethod
+    def _finding(evidence=None, **cite):
+        c = {"mpn": "TPS1", "page": 1, "quote": "Maximum input voltage 5.5 V"}
+        c.update(cite)
+        return {"detector": "deep_review", "category": "power", "severity": "warning",
+                "confidence": "high", "summary": "input headroom",
+                "evidence": evidence if evidence is not None
+                else {"components": ["U1"], "datasheet": [c]}}
+
+    def _one(self, finding, rc):
+        r, out = self._gate(self._doc([finding]))
+        self.assertEqual(r.returncode, rc, r.stderr)
+        return out
+
+    def test_default_datasheets_dir_follows_the_project(self):
+        other = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, other)
+        r, out = self._gate(self._doc([self._finding()]), cwd=other, ds=False)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(out["findings"][0]["evidence_checked"], "full")
+
+    def test_explicit_relative_datasheets_dir_is_cwd_relative(self):
+        path = self.tmp / "deep_review.json"
+        path.write_text(json.dumps(self._doc([self._finding()])), encoding="utf-8")
+        r = subprocess.run([sys.executable, str(GATE), str(path),
+                            "--analysis-dir", str(self.tmp / "analysis"),
+                            "--datasheets-dir", "datasheets"], cwd=self.tmp,
+                           capture_output=True, text=True, encoding="utf-8", timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(out["findings"][0]["evidence_checked"], "full")
+
+    def test_unchecked_pin_is_partial(self):
+        c = {"mpn": "TPS1", "page": 1, "quote": "Maximum input voltage 5.5 V"}
+        out = self._one(self._finding({"components": ["U1"], "pins": ["U1.3"],
+                                       "datasheet": [c]}), 0)
+        self.assertEqual(out["findings"][0]["evidence_checked"], "partial")
+
+    def test_legitimate_respellings_verify(self):
+        for quote, page in (("Maximum input voltage 5.5V", 1),
+                            ("maximum input voltage 5.5 v at −40 C", 1),
+                            ("Quiescent current 10 μA", 2)):
+            with self.subTest(quote=quote):
+                out = self._one(self._finding(quote=quote, page=page), 0)
+                self.assertEqual(out["findings"][0]["evidence_checked"], "full")
+
+    def test_absent_page_searches_the_whole_document(self):
+        f = self._finding(quote="Quiescent current 10 µA")
+        del f["evidence"]["datasheet"][0]["page"]
+        out = self._one(f, 0)
+        self.assertEqual(out["findings"][0]["evidence_checked"], "full")
+
+    def test_meaning_changes_quarantine(self):
+        for quote, page in (("Maximum input voltage 55 V", 1),
+                            ("voltage 5.5 V at 40 C", 1),
+                            ("Quiescent current 10 A", 2)):
+            with self.subTest(quote=quote):
+                out = self._one(self._finding(quote=quote, page=page), 1)
+                self.assertEqual(out["findings"], [])
+                self.assertIn("quote not found page", out["quarantined"][0]["quarantine_reason"])
+
+    def test_quote_without_content_quarantines(self):
+        out = self._one(self._finding(quote="..."), 1)
+        self.assertIn("has no letter or digit", out["quarantined"][0]["quarantine_reason"])
+
+    def test_page_below_one_quarantines(self):
+        for page in (0, -3):
+            with self.subTest(page=page):
+                out = self._one(self._finding(page=page), 1)
+                self.assertIn(f"page {page} is not a page number",
+                              out["quarantined"][0]["quarantine_reason"])
+
+    def test_page_past_the_end_quarantines(self):
+        out = self._one(self._finding(page=3), 1)
+        self.assertIn("page 3 is past the end of TPS1.pdf",
+                      out["quarantined"][0]["quarantine_reason"])
+
+    def test_non_object_evidence_quarantines(self):
+        for ev in ("U1", ["U1"]):
+            with self.subTest(evidence=ev):
+                out = self._one(self._finding(evidence=ev), 1)
+                reason = out["quarantined"][0]["quarantine_reason"]
+                self.assertIn("is not of type 'object'", reason)
+                self.assertIn("no design anchor", reason)
+
+    def test_non_array_findings_is_a_shape_error(self):
+        for key in ("findings", "quarantined"):
+            with self.subTest(key=key):
+                r, out = self._gate({**self._doc([]), key: 1})
+                self.assertEqual(r.returncode, 2)
+                self.assertIn(f"({key} must be an array)", r.stderr)
+                self.assertIsNone(out)
+
+    def test_null_findings_stay_empty(self):
+        r, out = self._gate(self._doc(None))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(out["findings"], [])
+
+    def test_unloadable_analyzer_json_exits_2_naming_the_file(self):
+        doc = self._doc([self._finding()])
+        for name, raw in (("schematic.json", b"[1]"), ("schematic.json", b"{not json"),
+                          ("schematic.json", b'{"components": "\xff"}'),
+                          ("pcb.json", b'"a string"'),
+                          ("schematic.json", b'{"components": ' + b"[" * 100000 + b"]" * 100000 + b"}")):
+            with self.subTest(name=name, raw=raw):
+                (self.tmp / "analysis" / "schematic.json").write_text(
+                    json.dumps({"components": [{"reference": "U1"}]}), encoding="utf-8")
+                (self.tmp / "analysis" / "pcb.json").unlink(missing_ok=True)
+                (self.tmp / "analysis" / name).write_bytes(raw)
+                r, out = self._gate(doc)
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertIn("cannot load inputs", r.stderr)
+                self.assertIn(name, r.stderr)
+                self.assertIsNone(out)
+
+    def test_deeply_nested_document_exits_2(self):
+        r, out = self._gate("[" * 100000 + "]" * 100000)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("cannot load inputs", r.stderr)
+        self.assertIsNone(out)
+
+    def test_deeply_nested_run_manifest_falls_back(self):
+        (self.tmp / "analysis" / "manifest.json").write_text(
+            "[" * 100000 + "]" * 100000, encoding="utf-8")
+        r, out = self._gate(self._doc([self._finding()]))
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_odd_shapes_inside_analyzer_json_are_ignored(self):
+        (self.tmp / "analysis" / "schematic.json").write_text(json.dumps(
+            {"components": [{"reference": "U1"}], "nets": ["VCC"]}), encoding="utf-8")
+        (self.tmp / "analysis" / "pcb.json").write_text(
+            json.dumps({"footprints": 7}), encoding="utf-8")
+        r, out = self._gate(self._doc([self._finding()]))
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    @unittest.skipIf(os.name == "nt", "POSIX modes")
+    def test_rewrite_keeps_the_file_mode_and_leaves_no_temp(self):
+        path = self.tmp / "deep_review.json"
+        path.write_text(json.dumps(self._doc([])), encoding="utf-8")
+        os.chmod(path, 0o640)
+        r, _ = self._gate(self._doc([self._finding()]))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o640)
+        self.assertEqual(sorted(p.name for p in self.tmp.iterdir()),
+                         ["analysis", "datasheets", "deep_review.json"])
+
+    @unittest.skipIf(os.name == "nt", "symlinks")
+    def test_symlinked_document_is_replaced_not_followed(self):
+        real = self.tmp / "elsewhere.json"
+        real.write_text(json.dumps(self._doc([self._finding()])), encoding="utf-8")
+        before = real.read_bytes()
+        link = self.tmp / "deep_review.json"
+        link.symlink_to(real)
+        deep_review_gate.write_text_atomic(link, "{}\n")
+        self.assertFalse(link.is_symlink())
+        self.assertEqual(link.read_text(encoding="utf-8"), "{}\n")
+        self.assertEqual(real.read_bytes(), before)
+
+    def test_utf8_under_an_ascii_locale(self):
+        f = self._finding(quote="Quiescent current 10 µA", page=2)
+        f["summary"] = "Iq 10 µA"
+        r, out = self._gate(self._doc([f]), env={"LC_ALL": "C", "PYTHONUTF8": "0",
+                                                 "PYTHONIOENCODING": "utf-8"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(out["findings"][0]["summary"], "Iq 10 µA")
+
+
+if __name__ == "__main__":
+    unittest.main()

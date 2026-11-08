@@ -1,0 +1,9 @@
+schema_version: "1.1"
+name: reads-plate-orientation-3mf
+expected_outcome: |
+  review.md reviews the parts as they sit on the plate: the hook is turned upside down there,
+  so its 8 mm foot becomes a flat cantilever about 17-20 mm up that needs a fix; the bar's
+  14 mm bridge between its posts is fine in PETG but the 6 mm arm sticking out sideways from the
+  bridge's middle will sag; the spacer-stack (two blocks touching) prints fine and isn't flagged.
+context:
+  scaffold_script: place-files.sh

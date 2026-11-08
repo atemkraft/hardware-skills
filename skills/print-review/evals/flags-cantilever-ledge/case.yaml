@@ -1,0 +1,8 @@
+schema_version: "1.1"
+name: flags-cantilever-ledge
+expected_outcome: |
+  review.md finds the 6 mm flat cantilever off the right column at about 18 mm height as a
+  droop risk that needs a fix (a 45 degree underside, a chamfer, or supports), and judges
+  the 12 mm bridge between the columns as printable in PETG.
+context:
+  scaffold_script: place-files.sh

@@ -1,0 +1,8 @@
+schema_version: "1.1"
+name: finds-island-and-overhang-ring
+expected_outcome: |
+  review.md finds the separate block floating about 5 mm above the bed (it starts in mid-air
+  and can't print without support or moving it down) and the knob's 4 mm flat overhang ring
+  at about 15 mm, with fixes for each.
+context:
+  scaffold_script: place-files.sh

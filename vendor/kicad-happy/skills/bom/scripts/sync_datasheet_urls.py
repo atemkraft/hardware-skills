@@ -1,0 +1,424 @@
+#!/usr/bin/env python3
+"""Sync datasheet URLs from datasheets/manifest.json back into KiCad schematic properties.
+
+After running datasheet sync scripts (DigiKey, LCSC, element14), this script
+reads the datasheets/manifest.json file (legacy name index.json still supported)
+and writes the discovered datasheet URLs back into the schematic's Datasheet
+properties.
+
+Opportunistic: only fills in missing/empty URLs by default. Warns about
+mismatched URLs without overwriting unless --overwrite is specified.
+
+Usage:
+    # Preview changes (dry run)
+    python3 sync_datasheet_urls.py path/to/schematic.kicad_sch --dry-run
+
+    # Apply — fill empty Datasheet fields, warn about mismatches
+    python3 sync_datasheet_urls.py path/to/schematic.kicad_sch
+
+    # Also overwrite mismatched URLs (after reviewing warnings)
+    python3 sync_datasheet_urls.py path/to/schematic.kicad_sch --overwrite
+
+    # Recursive (include sub-sheets)
+    python3 sync_datasheet_urls.py path/to/schematic.kicad_sch --recursive
+
+    # Custom datasheets directory
+    python3 sync_datasheet_urls.py path/to/schematic.kicad_sch --datasheets ./datasheets
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+from urllib.parse import urlparse
+
+sys.path.insert(0, str(Path(__file__).parent))
+from bom_fields import _canonical_for, _pick_mpn_from_props, _symbol_slots
+from distributor_core.manifest import load_index
+from edit_properties import apply_updates
+from kicad_sexp import (atomic_write_text, collect_schematic_files,
+                        iter_placed_symbol_blocks, kicad_lock_path)
+
+
+# ---------------------------------------------------------------------------
+# URL helpers
+# ---------------------------------------------------------------------------
+
+def is_empty_datasheet(value: str) -> bool:
+    """Return True if the Datasheet property is effectively empty."""
+    v = value.strip()
+    return not v or v == "~"
+
+
+def normalize_url(url: str) -> str:
+    """Normalize a URL for comparison purposes."""
+    url = url.strip().rstrip("/")
+    parsed = urlparse(url)
+    # Normalize scheme to https for comparison
+    scheme = "https" if parsed.scheme in ("http", "https") else parsed.scheme
+    # Lowercase the netloc (domain)
+    netloc = parsed.netloc.lower()
+    # Keep path and query as-is (case-sensitive on most servers, query
+    # params like ?v=2 can distinguish datasheet versions)
+    path = parsed.path.rstrip("/")
+    result = f"{scheme}://{netloc}{path}"
+    if parsed.query:
+        result += f"?{parsed.query}"
+    return result
+
+
+def urls_match(a: str, b: str) -> bool:
+    """Compare two URLs, ignoring trivial differences."""
+    return normalize_url(a) == normalize_url(b)
+
+
+# ---------------------------------------------------------------------------
+# Schematic parsing (lightweight — only extracts Reference + Datasheet)
+# ---------------------------------------------------------------------------
+
+_PROP_RE = re.compile(r'\(property\s+"((?:[^"\\]|\\.)*)"\s+"((?:[^"\\]|\\.)*)"')
+
+
+def _unescape(s: str) -> str:
+    return re.sub(r'\\(.)', lambda m: {"n": "\n"}.get(m.group(1), m.group(1)), s)
+
+
+def extract_ref_datasheets(text: str) -> dict[str, str]:
+    """Extract {reference: datasheet_url} from placed symbols in a schematic."""
+    return {ref: sym["datasheet"] for ref, sym in extract_symbols(text).items()}
+
+
+def extract_symbols(text: str) -> dict[str, dict]:
+    """Extract {reference: {"datasheet": url, "keys": [manifest keys]}} from placed symbols.
+
+    Keys are the symbol's own part identities in match order: MPN values, then
+    distributor and supplier-slot part numbers, then Value only when the symbol
+    carries neither.
+    """
+    result = {}
+
+    for _sym_start, _sym_end, block in iter_placed_symbol_blocks(text):
+        props = {_unescape(k): _unescape(v) for k, v in _PROP_RE.findall(block)}
+        ref = props.get("Reference")
+        if ref is None or ref.startswith("#"):
+            continue
+
+        keys: list[str] = []
+
+        def add(v):
+            v = str(v).strip()
+            if v and v != "~" and v not in keys:
+                keys.append(v)
+
+        add(_pick_mpn_from_props(props))
+        for name, value in props.items():
+            if _canonical_for(name) in ("digikey", "mouser", "lcsc", "element14"):
+                add(value)
+        for value in _symbol_slots(props).values():
+            add(value)
+        if not keys:
+            add(props.get("Value", ""))
+        result[ref] = {"datasheet": props.get("Datasheet", ""), "keys": keys}
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Manifest loading
+# ---------------------------------------------------------------------------
+
+def build_key_url_map(index: dict) -> dict[str, dict]:
+    """Build {manifest key: {url, source, verification}} from the manifest.
+
+    Only includes parts with status=ok and a valid datasheet_url.
+    Skips parts flagged as wrong datasheets by the verification step.
+    """
+    key_map = {}
+    for part_key, entry in index.get("parts", {}).items():
+        if entry.get("status") != "ok":
+            continue
+        raw = entry.get("datasheet_url")
+        url = raw.strip() if isinstance(raw, str) else ""
+        if not url:
+            continue
+        # Don't propagate URLs that verification flagged as wrong
+        if entry.get("verification") == "wrong":
+            continue
+        key_map[part_key] = {
+            "url": url,
+            "mpn": part_key,
+            "source": entry.get("source", ""),
+            "verification": entry.get("verification", ""),
+        }
+    return key_map
+
+
+# ---------------------------------------------------------------------------
+# Main sync logic
+# ---------------------------------------------------------------------------
+
+def sync_datasheet_urls(
+    schematic_path: str,
+    datasheets_dir: str | None = None,
+    recursive: bool = False,
+    overwrite: bool = False,
+    dry_run: bool = False,
+    backup: bool = False,
+) -> dict:
+    """Sync datasheet URLs from manifest.json (legacy index.json) into schematic Datasheet properties.
+
+    Returns summary dict with counts and mismatch details.
+    """
+    schematic_path = Path(schematic_path).resolve()
+    if not schematic_path.exists():
+        print(f"Error: {schematic_path} not found", file=sys.stderr)
+        return {"error": "schematic not found"}
+
+    # Find datasheets directory
+    if datasheets_dir:
+        ds_dir = Path(datasheets_dir).resolve()
+    else:
+        ds_dir = schematic_path.parent / "datasheets"
+    if not ds_dir.exists():
+        print(f"Error: datasheets directory not found at {ds_dir}", file=sys.stderr)
+        print("  Run a datasheet sync first (DigiKey, LCSC, or element14).", file=sys.stderr)
+        return {"error": "no datasheets directory"}
+
+    index_path = ds_dir / "manifest.json"
+    if not index_path.exists():
+        index_path = ds_dir / "index.json"
+    if not index_path.exists():
+        print(f"Error: {ds_dir / 'manifest.json'} not found", file=sys.stderr)
+        print("  Run a datasheet sync first to generate the manifest.", file=sys.stderr)
+        return {"error": "no manifest"}
+
+    try:
+        index = load_index(index_path)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return {"error": "unreadable manifest"}
+
+    key_url_map = build_key_url_map(index)
+    if not key_url_map:
+        print("No datasheet URLs available in manifest (no parts with status=ok).",
+              file=sys.stderr)
+        return {"error": "no urls in manifest"}
+
+    # Collect schematic files
+    sch_files = collect_schematic_files(schematic_path, recursive)
+    print(f"Processing {len(sch_files)} schematic file(s)...", file=sys.stderr)
+
+    # Track results
+    total_filled = 0
+    total_skipped = 0
+    total_already_correct = 0
+    total_mismatched = 0
+    total_overwritten = 0
+    mismatches = []
+    fills = []
+    files_modified = 0
+
+    write_root = schematic_path.parent
+    for sch_file in sch_files:
+        text = sch_file.read_text(encoding="utf-8")
+        current = extract_symbols(text)
+        ref_url_map = {}
+
+        updates = {}
+        for ref, sym in current.items():
+            current_ds = sym["datasheet"]
+            info = next((key_url_map[k] for k in sym["keys"] if k in key_url_map), None)
+            if info is None:
+                total_skipped += 1
+                continue
+            ref_url_map[ref] = info
+            new_url = info["url"]
+
+            if is_empty_datasheet(current_ds):
+                # Fill in the missing URL
+                updates[ref] = {"Datasheet": new_url}
+                fills.append({
+                    "reference": ref,
+                    "mpn": info["mpn"],
+                    "url": new_url,
+                    "file": sch_file.name,
+                })
+                total_filled += 1
+            elif urls_match(current_ds, new_url):
+                total_already_correct += 1
+            else:
+                # Mismatch — current URL differs from manifest URL
+                mismatches.append({
+                    "reference": ref,
+                    "mpn": info["mpn"],
+                    "current": current_ds,
+                    "index": new_url,
+                    "source": info["source"],
+                    "file": sch_file.name,
+                })
+                total_mismatched += 1
+                if overwrite:
+                    updates[ref] = {"Datasheet": new_url}
+                    total_overwritten += 1
+
+        if not updates:
+            continue
+
+        if dry_run:
+            for ref, props in sorted(updates.items()):
+                info = ref_url_map[ref]
+                action = "overwrite" if ref in [m["reference"] for m in mismatches] else "fill"
+                print(f"  [{sch_file.name}] {ref} ({info['mpn']}): "
+                      f"would {action} Datasheet", file=sys.stderr)
+        else:
+            if write_root != sch_file.parent and write_root not in sch_file.parents:
+                print(f"Warning: {sch_file} is outside {write_root}; not written",
+                      file=sys.stderr)
+                continue
+            modified_text, change_log = apply_updates(text, updates)
+
+            # Backup if requested
+            if backup:
+                from datetime import datetime
+                import shutil
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                backup_path = sch_file.with_suffix(f".{timestamp}.bak")
+                shutil.copy2(sch_file, backup_path)
+                print(f"  Backup: {backup_path}", file=sys.stderr)
+
+            atomic_write_text(sch_file, modified_text)
+            files_modified += 1
+
+    # Report fills
+    if fills:
+        label = "Would fill" if dry_run else "Filled"
+        print(f"\n{label} {len(fills)} empty Datasheet field(s):", file=sys.stderr)
+        for f in fills:
+            print(f"  {f['reference']} ({f['mpn']}): {f['url'][:80]}",
+                  file=sys.stderr)
+
+    # Report mismatches
+    if mismatches:
+        print(f"\nMismatched datasheet URLs ({len(mismatches)}):", file=sys.stderr)
+        for m in mismatches:
+            if overwrite:
+                action = "OVERWRITTEN" if not dry_run else "would overwrite"
+            else:
+                action = "kept existing (use --overwrite to replace)"
+            print(f"  {m['reference']} ({m['mpn']}) [{m['file']}]:", file=sys.stderr)
+            print(f"    Schematic: {m['current']}", file=sys.stderr)
+            print(f"    Index:     {m['index']} (from {m['source']})", file=sys.stderr)
+            print(f"    Action:    {action}", file=sys.stderr)
+
+    # Summary
+    summary = {
+        "filled": total_filled,
+        "already_correct": total_already_correct,
+        "mismatched": total_mismatched,
+        "overwritten": total_overwritten,
+        "skipped_no_index_entry": total_skipped,
+        "files_modified": files_modified if not dry_run else 0,
+        "mismatches": mismatches,
+    }
+
+    if dry_run:
+        changes = total_filled + total_overwritten
+        print(f"\nDry run: {changes} change(s) would be made.", file=sys.stderr)
+    else:
+        changes = total_filled + total_overwritten
+        if changes:
+            print(f"\nDone: {changes} Datasheet properties updated across "
+                  f"{files_modified} file(s).", file=sys.stderr)
+        else:
+            print("\nNo changes needed.", file=sys.stderr)
+
+    if total_already_correct:
+        print(f"Already correct: {total_already_correct}", file=sys.stderr)
+
+    # Lock file warning (same as edit_properties.py)
+    if not dry_run and files_modified:
+        for sch_file in sch_files:
+            if kicad_lock_path(sch_file).exists():
+                print(
+                    f"\nWARNING: KiCad lock file detected for {sch_file.name}.\n"
+                    f"Close and reopen the schematic (File > Open Recent) to see changes.\n"
+                    f"Don't save from KiCad first — it will overwrite these changes.",
+                    file=sys.stderr,
+                )
+                break  # One warning is enough
+
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Sync datasheet URLs from manifest.json (legacy index.json) into KiCad schematic Datasheet properties",
+    )
+    parser.add_argument(
+        "schematic",
+        help="Path to root .kicad_sch file (KiCad 5 .sch is rejected)",
+    )
+    parser.add_argument(
+        "--datasheets", "-d",
+        help="Path to datasheets directory (default: datasheets/ next to schematic)",
+    )
+    parser.add_argument(
+        "--recursive", "-r", action="store_true",
+        help="Include hierarchical sub-sheets",
+    )
+    parser.add_argument(
+        "--overwrite", action="store_true",
+        help="Overwrite mismatched Datasheet URLs (default: warn only)",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Show what would change without modifying files",
+    )
+    parser.add_argument(
+        "--backup", action="store_true",
+        help="Create .bak backup files before writing (default: no backup, use git)",
+    )
+    parser.add_argument(
+        "--json", action="store_true",
+        help="Output summary as JSON to stdout",
+    )
+    args = parser.parse_args()
+
+    if args.schematic.lower().endswith(".sch"):
+        print("Error: KiCad 5 .sch files are read only; sync Datasheet URLs in a .kicad_sch file",
+              file=sys.stderr)
+        sys.exit(1)
+
+    result = sync_datasheet_urls(
+        schematic_path=args.schematic,
+        datasheets_dir=args.datasheets,
+        recursive=args.recursive,
+        overwrite=args.overwrite,
+        dry_run=args.dry_run,
+        backup=args.backup,
+    )
+
+    if args.json:
+        json.dump(result, sys.stdout, indent=2)
+        print()
+
+    if "error" in result:
+        sys.exit(1)
+    if result.get("mismatched", 0) > 0 and not args.overwrite:
+        sys.exit(2)  # Signal mismatches need attention
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    for _stream in (sys.stdout, sys.stderr):  # UTF-8 on a cp1252 pipe (Windows)
+        if (getattr(_stream, "encoding", "") or "").lower().replace("-", "") != "utf8" \
+                and hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+    main()

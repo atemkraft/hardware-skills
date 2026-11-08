@@ -1,0 +1,14 @@
+{
+ "name": "pcb-signoff",
+ "description": "Review a KiCad board, check every part against its datasheet, check JLC placement and stock, review the printed enclosure, and cart it at JLCPCB without checking out.",
+ "version": "0.4.0",
+ "license": "MIT",
+ "keywords": [
+  "kicad",
+  "pcb",
+  "jlcpcb",
+  "hardware",
+  "review",
+  "datasheet"
+ ]
+}

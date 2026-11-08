@@ -1,0 +1,100 @@
+{
+  "schematic": "<WORK>/bom-identity.schematic.json",
+  "last_sync": "2026-10-16T00:00:00+00:00",
+  "parts": {
+    "LM358DRG4": {
+      "file": "LM358DR_Dual_Operational_Amplifier.pdf",
+      "manufacturer": "Texas Instruments",
+      "description": "Dual Operational Amplifier",
+      "value": "LM358",
+      "datasheet_url": "https://www.farnell.com/datasheets/fixture/lm358.pdf",
+      "downloaded_date": "2026-10-16T00:00:00+00:00",
+      "source": "element14",
+      "element14": "11AB1001",
+      "status": "ok",
+      "references": [
+        "U1"
+      ],
+      "size_bytes": 79,
+      "verification": "verified"
+    },
+    "TPS61023": {
+      "manufacturer": "Texas Instruments",
+      "description": "Boost Converter",
+      "value": "TPS61023",
+      "references": [
+        "U2"
+      ],
+      "status": "not_found",
+      "error": "No matching element14 result for 'TPS61023' (closest: 'TPS61023DRLR', a different part)",
+      "last_attempt": "2026-10-16T00:00:00+00:00",
+      "failed_providers": [
+        "element14"
+      ]
+    },
+    "LM358": {
+      "file": "LM358DR_Dual_Operational_Amplifier.pdf",
+      "manufacturer": "Texas Instruments",
+      "description": "Dual Operational Amplifier",
+      "value": "LM358",
+      "datasheet_url": "https://www.farnell.com/datasheets/fixture/lm358.pdf",
+      "downloaded_date": "2026-10-16T00:00:00+00:00",
+      "source": "element14",
+      "element14": "11AB1001",
+      "status": "ok",
+      "references": [
+        "U3"
+      ],
+      "size_bytes": 79,
+      "verification": "verified"
+    },
+    "2N7002": {
+      "manufacturer": "onsemi",
+      "description": "N-Channel MOSFET",
+      "value": "2N7002",
+      "references": [
+        "Q1"
+      ],
+      "status": "not_found",
+      "error": "No matching element14 result for '2N7002' (closest: '2N7002V', a different part)",
+      "last_attempt": "2026-10-16T00:00:00+00:00",
+      "failed_providers": [
+        "element14"
+      ]
+    },
+    "SI2302": {
+      "file": "SI2302_N-Channel_MOSFET_20V.pdf",
+      "manufacturer": "Vishay",
+      "description": "N-Channel MOSFET 20V",
+      "value": "SI2302",
+      "datasheet_url": "https://www.farnell.com/datasheets/fixture/si2302.pdf",
+      "downloaded_date": "2026-10-16T00:00:00+00:00",
+      "source": "element14",
+      "element14": "15AB1005",
+      "status": "ok",
+      "references": [
+        "Q3",
+        "Q2",
+        "Q4"
+      ],
+      "size_bytes": 78,
+      "verification": "verified"
+    },
+    "2N7002V": {
+      "file": "2N7002V_Dual_N-Channel_MOSFET.pdf",
+      "manufacturer": "onsemi",
+      "description": "Dual N-Channel MOSFET",
+      "value": "2N7002V",
+      "datasheet_url": "https://www.farnell.com/datasheets/fixture/2n7002v.pdf",
+      "downloaded_date": "2026-10-16T00:00:00+00:00",
+      "source": "element14",
+      "element14": "17AB1007",
+      "status": "ok",
+      "references": [
+        "Q5"
+      ],
+      "size_bytes": 79,
+      "verification": "verified"
+    }
+  }
+}
