@@ -1,0 +1,10 @@
+schema_version: "1.1"
+name: jlc3dp-mjf-thin-wall-and-cavity
+expected_outcome: |
+  review.md finds the 1.0 mm plate thinner than JLC3DP's MJF minimum wall for a part this size
+  (2.0 mm for a 100 mm part, or at least 1.5 mm for the 60 mm plate on its own), and the sealed
+  10 mm cavity inside the block that needs escape holes (at least 2.5 mm, two if under 3 mm).
+  It cites JLC3DP's guideline, and it doesn't call the block's overhangs a support problem,
+  since MJF prints in powder.
+context:
+  scaffold_script: place-files.sh

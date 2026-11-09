@@ -73,6 +73,9 @@ edges. Then measure what DRC can't:
   python3 skills/print-review/scripts/print_review.py review/print enclosure.3mf --material PETG
   ```
   No ledges or arms that droop, bridges within the material's span, no islands.
+  If JLC3DP prints it, add the process and material (`--service jlc3dp:mjf:PA12`): no thin
+  walls for the part's size and no sealed cavities, or each one is a written decision. Then
+  every checklist line (detail, holes, posts, clearances, tolerances) answered against the design.
 
 ## 7. Cart: `jlcpcb-cart` (never check out)
 
