@@ -85,6 +85,16 @@ different order in the file.
 
 ## Limits
 
+- A session (SES) carries the parts' positions as well as the copper: importing it puts
+  every part back where it was when routed. Move a part and import an older session, and
+  the part quietly moves back (the board still passes DRC). Only import a session whose
+  DSN hash matches the board; to move one part on a finished board, route afresh or
+  re-route that corner by hand.
+- A board that routed once may not route again from scratch: a later change can leave a
+  fresh route well short (one board went from 10 unrouted to 64). Keep the routed session with the
+  board (`--keep`), and make small later changes in a way that doesn't need a re-route
+  (silkscreen, values, a label moved instead of a part).
+
 - It routes only: Freerouting's optimizer is off (on a dense board it can run far longer
   than the routing, single-threaded).
 - The autoroute settings (via cost, F.Cu horizontal, B.Cu vertical) are a reasonable

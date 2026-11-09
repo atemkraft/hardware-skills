@@ -67,6 +67,9 @@ pane often can't attach local files.
 - Baking: if the maker's datasheet gives a higher MSL than JLC lists, JLC won't offer
   baking. Ask in the **Assembly Remark** ("Please bake D11-D13 (part, LCSC#) before reflow:
   the maker's datasheet rates them MSL 5a").
+- The remarks are hidden behind **Remark ✎**: click the pencil first (it opens Assembly
+  Remark and PCB Remark); text typed before that goes nowhere. Read the textareas back
+  before saving.
 - SAVE TO CART. The cart can show empty for a few seconds; reload and read it as text.
 
 ## Swapping a stale item

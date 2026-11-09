@@ -27,6 +27,12 @@ Run them from the build so they can't be skipped:
 - **A stricter community JLCPCB rule file**
   ([labtroll/KiCad-DesignRules](https://github.com/labtroll/KiCad-DesignRules), fetched at
   run time) as a second opinion on your own `.kicad_dru`.
+- **Silkscreen on parts:** `scripts/silk_check.py <board.kicad_pcb>` (KiCad's Python)
+  lists board-level logos, labels and lines that land on another part's pad or inside a
+  part's courtyard. DRC doesn't check this, and parts added late (a sensor, its bypass cap)
+  end up on top of a logo or a test point's label. Look at each hit in the render: a label
+  beside its own pad or a frame drawn round a group on purpose is fine (`--allow` those
+  references next time).
 - **SPICE** on the power path if the project has decks (ngspice, with the makers' models
   where they publish them: check a model against its datasheet table before trusting it).
 
@@ -37,6 +43,8 @@ new.
 ## 3. Human review (DRC can't see these)
 
 - **Board picture:** placement, silkscreen readable and on the right parts, polarity marks.
+  Re-run `silk_check.py` after any placement change, and look at the fab's own preview
+  before saving the order: no logo or label under a part.
 - **3D and enclosure:** heights under the lid (check that the 3D models' heights are the
   makers' maximums), connector overhang, cable routes, a fit check against the box.
 - **Connectors against the real cables:** pinout, polarity, plug direction, crossover vs
