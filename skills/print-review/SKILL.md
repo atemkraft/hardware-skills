@@ -34,9 +34,16 @@ Config (all optional), as JSON:
 `{"bed_mm": [256, 256], "overhang_max_deg": 45, "bridge_max_mm": {"PETG": 15, "PLA": 20,
 "TPU": 5, "*": 10}, "ledge_max_mm": 0.5, "min_area_mm2": 2, "tall_ratio": 5,
 "material": {"<file name>": "PETG"}}`. Set the material per file when a project mixes
-them (TPU bridges far less well than PETG). `"wall_min_mm": 1.2` adds the wall check (below)
-for your own printer too, for example 3 perimeters of a 0.4 mm nozzle; `"thin_rows": 15` is how
-many thin regions per part get their own row.
+them (TPU bridges far less well than PETG). `"wall_min_mm": 0.8` adds the wall check (below)
+for your own printer too: 0.8 is two lines of a 0.4 mm nozzle. On your own printer it goes by
+direction, as a slicer does. Material measured **across** (side walls, text strokes, fins) is
+held to `wall_min_mm`, and each row says whether it's one line wide (prints, but weak), narrower
+than the nozzle (may print thin or not at all), or under half the nozzle (the slicer drops it,
+which is fine for a modelling sliver). Material measured **top to bottom** (floors, steps, lips)
+only has to be one `layer_mm` layer (0.2), so a two-layer lip passes. Only parallel faces count
+as a wall, so a chamfer's V or a ramped bead tapering to an edge isn't flagged. Set
+`"nozzle_mm"` (0.4) and `"layer_mm"` to match the print. `"thin_rows": 15` is how many thin
+regions per part get their own row.
 
 ## Ordered from JLC3DP
 
@@ -88,7 +95,7 @@ With a wall minimum (`--service`, or `wall_min_mm`):
 
 | Kind | What it is | Flagged when | Usual fixes |
 |---|---|---|---|
-| **thin** | material thinner than the minimum, measured straight through from the surface | over `wall_min_area_mm2` (1 mm²) | thicken; for text, bigger or bolder (stroke ≥ the detail rule); another process |
+| **thin** | material thinner than the minimum, measured straight through from the surface (own printer: across against `wall_min_mm`, top to bottom against one layer) | over `wall_min_area_mm2` (1 mm²) | thicken; for text, bigger or bolder (stroke ≥ the detail rule, or 2 lines on your own printer); another process |
 | **void** | a sealed cavity inside the part (not FDM) | always | escape holes, ≥ 2.5 mm, two if < 3 mm; or make it solid |
 | **size** | outside the service's largest or smallest part | always | split the part, another material/process, or add a sprue/frame for tiny parts |
 

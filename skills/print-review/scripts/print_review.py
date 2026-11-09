@@ -28,13 +28,18 @@ largest and smallest size the process takes, minimum wall thickness for the part
 (measured by casting a ray inward from every face), and enclosed voids that need escape
 holes; and lists that process's numbers for what it can't measure (details, holes, posts,
 clearances, threads, tolerances). The numbers are in JLC3DP below and in
-references/jlc3dp.md. A wall check without a service: "wall_min_mm" in the config.
+references/jlc3dp.md. A wall check for your own printer: "wall_min_mm" in the config.
 
 Config (all optional): {"bed_mm": [256, 256], "overhang_max_deg": 45,
 "bridge_max_mm": {"PETG": 15, "PLA": 20, "TPU": 5, "*": 10}, "ledge_max_mm": 0.5,
 "min_area_mm2": 2,
 "tall_ratio": 5, "material": {"<3mf file name>": "PETG", ...}, "wall_min_mm": null,
-"wall_min_area_mm2": 1, "thin_rows": 15}
+"wall_min_area_mm2": 1, "thin_rows": 15, "layer_mm": 0.2, "nozzle_mm": 0.4}
+
+On your own printer the wall check (wall_min_mm) is direction-aware: material measured
+across (side walls, text strokes, fins) is held to wall_min_mm, and under 0.9 x nozzle_mm
+it says the line may not print at all; material measured top to bottom (floors, steps,
+ledges) only has to be one layer_mm layer. JLC3DP's minimums apply in every direction.
 """
 import json
 import math
@@ -50,7 +55,7 @@ NS = "{http://schemas.microsoft.com/3dmanufacturing/core/2015/02}"
 DEF = {"bed_mm": [256, 256], "overhang_max_deg": 45,
        "bridge_max_mm": {"PETG": 15, "PLA": 20, "TPU": 5, "*": 10},
        "ledge_max_mm": 0.5, "min_area_mm2": 2, "tall_ratio": 5, "material": {},
-       "wall_min_mm": None, "wall_min_area_mm2": 1, "thin_rows": 15}
+       "wall_min_mm": None, "wall_min_area_mm2": 1, "thin_rows": 15, "layer_mm": 0.2, "nozzle_mm": 0.4}
 
 # JLC3DP 3D Printing Design Guideline, https://jlc3dp.com/help/article/3d-printing-design-guideline
 # ("Last updated on Nov 04, 2026"; read 2026-11-09). Section numbers are the guideline's.
@@ -239,10 +244,13 @@ def ray_tri(o, d, t):
     return (e2[0] * q[0] + e2[1] * q[1] + e2[2] * q[2]) / det
 
 
-def thin_walls(tris, info, edge_owner, wall_min, min_area):
+def thin_walls(tris, info, edge_owner, wall_min, min_area, layer_min=None):
     """Regions thinner than wall_min: from points spread over every face (about one per
     0.25 mm²... 4 mm²), a ray goes straight in; the material is as thick as the distance to
-    where it comes out. Rays are only followed wall_min mm, through a 1 mm grid."""
+    where it comes out. Rays are only followed wall_min mm, through a 1 mm grid.
+    With layer_min (your own FDM printer), thickness measured up or down (faces within
+    45° of flat) is held to layer_min instead: one layer prints, a line narrower than the
+    nozzle doesn't. Each region is "xy" (measured across) or "z" (top to bottom)."""
     C = 1.0
     grid = defaultdict(list)
     for i, t in enumerate(tris):
@@ -260,6 +268,11 @@ def thin_walls(tris, info, edge_owner, wall_min, min_area):
             continue
         k = max(1, min(60, int(math.ceil(math.sqrt(a) / step))))
         d = (-n[0], -n[1], -n[2])
+        axis = "z" if layer_min is not None and abs(n[2]) >= 0.7 else "xy"
+        limit = layer_min - 0.02 if axis == "z" else wall_min     # exactly one layer prints
+        # own printer: only parallel faces make a wall; a taper to an edge (a chamfer's V,
+        # a ramped bead) is sliced fine, so the exit face must be within about 25° of facing back
+        leave = 0.9 if layer_min is not None else 0.2
         bad, total, tmin, pts = 0, 0, None, []
         for r in range(k):
             for c in range(k - r):
@@ -280,18 +293,18 @@ def thin_walls(tris, info, edge_owner, wall_min, min_area):
                         if j == i:
                             continue
                         nj = info[j][0]
-                        if nj[0] * d[0] + nj[1] * d[1] + nj[2] * d[2] < 0.2:   # must be where the ray leaves
+                        if nj[0] * d[0] + nj[1] * d[1] + nj[2] * d[2] < leave:   # must be where the ray leaves
                             continue
                         h = ray_tri(o, d, tris[j])
                         # under 0.05 mm is a sliver in the mesh (text or a cut meeting a face), not a wall
-                        if h is not None and 0.05 < h < wall_min and (best is None or h < best):
+                        if h is not None and 0.05 < h < limit and (best is None or h < best):
                             best = h
                 if best is not None:
                     bad += 1
                     tmin = best if tmin is None else min(tmin, best)
                     pts.append(o)
         if bad:
-            thin[i] = (bad, total, tmin, pts)
+            thin[i] = (bad, total, tmin, pts, axis)
     seen, out = set(), []
     for s0 in thin:
         if s0 in seen:
@@ -303,14 +316,14 @@ def thin_walls(tris, info, edge_owner, wall_min, min_area):
             t = tris[i]
             for e in ((t[0], t[1]), (t[1], t[2]), (t[2], t[0])):
                 for j in edge_owner[tuple(sorted((key(e[0]), key(e[1]))))]:
-                    if j in thin and j not in seen:
+                    if j in thin and j not in seen and thin[j][4] == thin[s0][4]:
                         seen.add(j); stack.append(j)
         area = sum(info[i][1] * thin[i][0] / thin[i][1] for i in comp)
         if area < min_area:
             continue
         pts = [p for i in comp for p in thin[i][3]]
         tmin = min(thin[i][2] for i in comp)
-        out.append(dict(area=area, tmin=tmin, tris=comp,
+        out.append(dict(area=area, tmin=tmin, tris=comp, axis=thin[s0][4],
                         bbox=(min(p[0] for p in pts), min(p[1] for p in pts), max(p[0] for p in pts), max(p[1] for p in pts)),
                         z=sum(p[2] for p in pts) / len(pts)))
     return out
@@ -344,7 +357,7 @@ def voids(tris, edge_owner):
     return out
 
 
-def analyse(tris, cfg, material, wall_min=None, find_voids=False, detail_mm=None):
+def analyse(tris, cfg, material, wall_min=None, find_voids=False, detail_mm=None, layer_min=None):
     zmin = min(min(p[2] for p in t) for t in tris)
     xs = [p[0] for t in tris for p in t]; ys = [p[1] for t in tris for p in t]
     height = max(p[2] for t in tris for p in t) - zmin
@@ -528,10 +541,26 @@ def analyse(tris, cfg, material, wall_min=None, find_voids=False, detail_mm=None
                           why=f"{area:.1f} mm² sloping past {cfg['overhang_max_deg']}° from vertical, up to {worst:.0f}°",
                           tris=comp, worst=worst))
     if wall_min:
-        for w in thin_walls(tris, info, edge_owner, wall_min, cfg["wall_min_area_mm2"]):
-            found.append(dict(kind="thin", z=w["z"] - zmin, area=w["area"], bbox=w["bbox"], size=wall_min - w["tmin"],
+        for w in thin_walls(tris, info, edge_owner, wall_min, cfg["wall_min_area_mm2"], layer_min):
+            if layer_min is None:
+                what = f"wall {w['tmin']:.2f} mm thick over about {w['area']:.1f} mm² (min {wall_min} mm)"
+            elif w["axis"] == "z":
+                what = (f"{w['tmin']:.2f} mm top to bottom over about {w['area']:.1f} mm²: under one "
+                        f"{layer_min} mm layer, so the slicer drops or merges it")
+            else:
+                what = (f"{w['tmin']:.2f} mm across over about {w['area']:.1f} mm² (min {wall_min} mm"
+                        f"{', nozzle ' + str(cfg['nozzle_mm']) + ' mm' if cfg.get('nozzle_mm') else ''})"
+                        + (": under half the nozzle, the slicer drops it (fine if it's a modelling sliver, "
+                           "a problem if it's meant to be there)"
+                           if cfg.get("nozzle_mm") and w["tmin"] < cfg["nozzle_mm"] * 0.5 else
+                           ": narrower than the nozzle, may print thin or not at all"
+                           if cfg.get("nozzle_mm") and w["tmin"] < cfg["nozzle_mm"] * 0.9 else
+                           ": one line wide, prints but is weak" if cfg.get("nozzle_mm")
+                           and w["tmin"] < cfg["nozzle_mm"] * 2 * 0.95 else ""))
+            limit = layer_min if layer_min is not None and w["axis"] == "z" else wall_min
+            found.append(dict(kind="thin", z=w["z"] - zmin, area=w["area"], bbox=w["bbox"], size=limit - w["tmin"],
                               tmin=w["tmin"], bad=True, tris=w["tris"],
-                              why=f"wall {w['tmin']:.2f} mm thick over about {w['area']:.1f} mm² (min {wall_min} mm)"
+                              why=what
                                   + (f"; if it's text or a fine detail, JLC3DP 3 wants {detail_mm} mm wide and deep"
                                      if detail_mm and w["area"] < 50 else "")))
     if find_voids:
@@ -621,7 +650,8 @@ def main():
                 dims0 = [max(p[j] for t in tris for p in t) - min(p[j] for t in tris for p in t) for j in range(3)]
                 wall = jlc_wall_min(proc, dims0) or wall
             res = analyse(tris, cfg, material, wall_min=wall, find_voids=bool(proc and proc["voids"]),
-                          detail_mm=proc.get("detail") if proc else None)
+                          detail_mm=proc.get("detail") if proc else None,
+                          layer_min=None if proc else cfg["layer_mm"])
             if proc:
                 size = jlc_size(proc, proc_mat, res["dims"])
                 for ok, why in size:
